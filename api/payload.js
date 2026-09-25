@@ -112,21 +112,23 @@ async function handler(req, res) {
   } catch (e) {}
   if (P.aiSignals(req) >= 3) return P.sendTarpit(res);
 
-  // v4: key Turnstile BẮT BUỘC cho mọi request — không còn đường free/isKnownHwid.
-  // key=db123 sai -> DIE ở đây trước cả khi check ticket (đúng case AI vừa bẻ).
-  if (!ukey || !P.verifyUserKey(ukey, hwid)) {
+  // REQUIRE_KEY=1: key Turnstile BẮT BUỘC cho mọi request.
+  // Tắt verify (mặc định): bỏ qua key, ticket chỉ bind IP.
+  if (P.REQUIRE_KEY && (!ukey || !P.verifyUserKey(ukey, hwid))) {
     const host = P.getHost(req);
     res.setHeader("Content-Type", "text/plain; charset=utf-8");
     return res.status(200).send(`error("verify required: open https://${host}/api/verify?hwid=${hwid} [sodium v4]")`);
   }
 
-  // k = ticket.sig (ticket = rand16.ts10, sig = HMAC bind subnet+HWID lúc xin raw)
+  // k = ticket.sig (ticket = rand16.ts10, sig = HMAC bind subnet [+HWID nếu có key])
   const m = k.match(/^([0-9a-f]{16}\.\d{10})\.([0-9a-f]{64})$/);
   if (!m) return P.sendLuaError(res);
   const ticket = m[1];
   const sig = m[2];
-  // 1) Ticket phải bind đúng subnet IP + đúng HWID đã verify -> đổi hwid (recrack-01) DIE
-  if (!P.verifyTicket(ticket, sig, ip, hwid)) return P.sendLuaError(res);
+  // 1) Ticket phải bind đúng subnet IP (+ đúng HWID nếu raw cấp theo key).
+  // Chấp nhận cả 2 dạng để loader public (không key) và loader cá nhân đều chạy.
+  const ticketOk = P.verifyTicket(ticket, sig, ip, hwid) || P.verifyTicket(ticket, sig, ip, "unknown");
+  if (!ticketOk) return P.sendLuaError(res);
   // 2) PoW: phải exec Lua mới có nonce -> curl chay DIE
   if (!P.powVerify(ticket, nonce)) return P.sendLuaError(res);
   // 3) Replay: 1 ticket 1 lần (per-instance; muốn tuyệt đối thì dùng KV/Redis)

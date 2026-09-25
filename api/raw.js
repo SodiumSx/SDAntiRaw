@@ -46,6 +46,7 @@ function buildLoader(host, ticket, sig, ukey, boundHwid) {
   const hostLua = splitHostLua(host);
   const safeBound = (boundHwid || "").replace(/[^A-Za-z0-9_\-.:]/g, "").slice(0, 80);
   const keyTail = ukey ? `..'&key=${ukey}'` : "";
+  const enforceLine = safeBound ? `if ${vH}~='${safeBound}' then error("verify required: open https://${host}/api/verify?hwid="..${vH}.." [sodium v4]") end` : "";
 
   return `-- sodium loader v4
 local ${vS}=${idLua}
@@ -53,7 +54,7 @@ local ${vT}='${ticket}.${sig}'
 if typeof(game)~='Instance' or typeof(workspace)~='Instance' then error('unauthorized [sodium v4]') end
 local ${vG}=(typeof(gethwid)=='function' and gethwid() or game:GetService('RbxAnalyticsService'):GetClientId())
 local ${vH}=tostring(${vG} or 'unknown'):gsub('[^%w%-%.:]','')
-if ${vH}~='${safeBound}' then error("verify required: open https://${host}/api/verify?hwid="..${vH}.." [sodium v4]") end
+${enforceLine}
 local ${vP}=tostring(game.PlaceId)
 local ${vJ}=tostring(game.JobId or 'unknown')
 local function ${vF}(${vW})
@@ -82,28 +83,30 @@ async function handler(req, res) {
   const q = req.query || {};
   const ukey = ((q.key) || "").toString().replace(/[^0-9a-f.]/g, "").slice(0, 80);
   const uhwid = P.sanitizeHwid(q.hwid);
+  const hasValidKey = ukey && P.validHwid(uhwid) && P.verifyUserKey(ukey, uhwid);
 
-  // Cửa chính v4: thiếu key hoặc thiếu hwid -> KHÔNG ticket, chỉ helper báo link verify.
-  // Chain AI cũ (GET /api/raw trơn -> ticket fresh) DIE tại đây.
-  if (!ukey || !P.validHwid(uhwid) || !P.verifyUserKey(ukey, uhwid)) {
+  // REQUIRE_KEY=1: thiếu key/hwid đúng -> KHÔNG ticket, chỉ helper báo link verify.
+  // Tắt verify (mặc định): public loader chạy thẳng như cũ.
+  if (P.REQUIRE_KEY && !hasValidKey) {
     return P.sendVerifyHelper(res, host);
   }
 
-  // Key đúng nhưng IP datacenter -> tarpit (chặn AI solve Turnstile 1 lần rồi scrape từ cloud).
-  // User VPN datacenter bị ảnh hưởng: tradeoff đã ghi rõ, dùng mạng dân cư để chạy.
+  // IP datacenter -> tarpit (chặn AI scrape từ cloud).
   try {
     if (await P.isDatacenterIP(ip)) return P.sendTarpit(res);
   } catch (e) {}
   if (P.aiSignals(req) >= 3) return P.sendTarpit(res);
 
-  if (!P.checkHwidThrottle(uhwid, ip)) return P.sendLuaError(res);
+  const throttleHwid = hasValidKey ? uhwid : (P.validHwid(uhwid) ? uhwid : ip);
+  if (!P.checkHwidThrottle(throttleHwid, ip)) return P.sendLuaError(res);
 
-  // Ticket bind CẢ subnet IP lẫn HWID đã verify -> đổi hwid lúc gọi payload là DIE.
+  // Có key đúng -> ticket bind CẢ subnet IP lẫn HWID. Không key -> bind IP only ("unknown").
   const ticket = P.makeTicket();
-  const sig = P.signTicket(ticket, ip, uhwid);
-  P.rememberHwid(uhwid);
+  const bindHwid = hasValidKey ? uhwid : "unknown";
+  const sig = P.signTicket(ticket, ip, bindHwid);
+  if (hasValidKey) P.rememberHwid(uhwid);
   res.setHeader("Content-Type", "text/plain; charset=utf-8");
-  return res.status(200).send(buildLoader(host, ticket, sig, ukey, uhwid));
+  return res.status(200).send(buildLoader(host, ticket, sig, hasValidKey ? ukey : "", hasValidKey ? uhwid : ""));
 }
 
 module.exports = handler;

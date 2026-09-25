@@ -6,6 +6,9 @@ const crypto = require("crypto");
 const SCRIPT_ID = "sodiumhub_main";
 const LOADER_SECRET = (process.env.LOADER_SECRET || "d4f3788b69f4cab33095e28b7261cf909a28a061eb6039598aa2e554d6a9859b").trim();
 const ALLOWED_PLACES = (process.env.ALLOWED_PLACES || "").trim();
+// Tắt verify Turnstile tạm thời: public loader chạy thẳng, không cần key.
+// Muốn bật lại: set Env REQUIRE_KEY=1 trên Vercel rồi deploy lại.
+const REQUIRE_KEY = (process.env.REQUIRE_KEY || "").trim() === "1";
 
 // Cloudflare Turnstile — checkpoint 1 lan cho HWID la (nguoi tich 10s, AI curl bo tay).
 // Site key hien o web, Secret chi server dung. Env (neu set) uu tien hon hardcode.
@@ -403,6 +406,7 @@ function sendTarpit(res) {
 }
 
 module.exports = {
+  REQUIRE_KEY,
   SCRIPT_ID,
   LOADER_SECRET,
   ALLOWED_PLACES,
