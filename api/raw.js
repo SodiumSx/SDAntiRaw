@@ -1,7 +1,9 @@
-// /api/raw v3 — anti-AI: ticket bind IP/24 + PoW Lua + Roblox env attestation
-// Luồng: executor HttpGet(/api/raw) -> loader chứa ticket.sig (bind subnet IP xin raw, 180s, 1 lần)
-// -> loader CHECK môi trường Roblox thật, giải PoW bằng Lua, rồi gọi /api/payload?s&k&hwid&place&n&job
-// AI chỉ curl mà không exec Luau / không ở IP dân cư / không có JobId thật -> DIE toàn tập.
+// /api/raw v4 — ACCESS CONTROL thật: KHÔNG key thì KHÔNG ticket.
+// Luồng đúng duy nhất:
+//   browser: GET /api/verify?hwid=... + Turnstile -> loader cá nhân (?key= bound HWID)
+//   executor: loader cá nhân thu HWID -> GET /api/raw?key=...&hwid=... -> ticket bind (IP/24 + HWID)
+//   executor: stage2 exec Lua (env check + PoW) -> GET /api/payload?s&k&hwid&place&n&job&key
+// Chain cũ của AI (raw public -> ticket fresh -> payload hwid tự khai recrack-01) DIE ở bước 1.
 
 const P = require("./_protect");
 
@@ -28,8 +30,7 @@ function splitIdLua(id) {
   return `'${id.slice(0, cut)}'..'${id.slice(cut)}'`;
 }
 
-function buildLoader(host, ticket, sig, ukey) {
-  // Tên biến random mỗi request -> tool hardcode _s/_t/_u chết.
+function buildLoader(host, ticket, sig, ukey, boundHwid) {
   const vS = randName();
   const vT = randName();
   const vG = randName();
@@ -43,20 +44,18 @@ function buildLoader(host, ticket, sig, ukey) {
   const vE = randName();
   const idLua = splitIdLua(P.SCRIPT_ID);
   const hostLua = splitHostLua(host);
-  // Key cá nhân (?key= từ loader riêng sau Turnstile) được truyền tiếp xuống payload.
+  const safeBound = (boundHwid || "").replace(/[^A-Za-z0-9_\-.:]/g, "").slice(0, 80);
   const keyTail = ukey ? `..'&key=${ukey}'` : "";
 
-  return `-- sodium loader v3
+  return `-- sodium loader v4
 local ${vS}=${idLua}
 local ${vT}='${ticket}.${sig}'
--- [1] Roblox env attestation: AI chạy python/plain-lua không có game/workspace/JobId là DIE ngay
-if typeof(game)~='Instance' or typeof(workspace)~='Instance' then error('unauthorized [sodium v3]') end
+if typeof(game)~='Instance' or typeof(workspace)~='Instance' then error('unauthorized [sodium v4]') end
 local ${vG}=(typeof(gethwid)=='function' and gethwid() or game:GetService('RbxAnalyticsService'):GetClientId())
 local ${vH}=tostring(${vG} or 'unknown'):gsub('[^%w%-%.:]','')
-if #${vH}<3 then error('unauthorized [sodium v3]') end
+if ${vH}~='${safeBound}' then error("verify required: open https://${host}/api/verify?hwid="..${vH}.." [sodium v4]") end
 local ${vP}=tostring(game.PlaceId)
 local ${vJ}=tostring(game.JobId or 'unknown')
--- [2] PoW anti-curl: phải EXEC Lua mới ra nonce, AI chỉ copy URL là DIE (server verify hash % ${P.POW_DIFFICULTY} == 0)
 local function ${vF}(${vW})
  local _h=5381
  for _i=1,#${vW} do _h=(_h*33+${vW}:byte(_i))%4294967296 end
@@ -65,21 +64,12 @@ end
 local ${vN}=0
 while ${vF}('${ticket}|'..${vN})%${P.POW_DIFFICULTY}~=0 do
  ${vN}=${vN}+1
- if ${vN}>5000000 then error('unauthorized [sodium v3]') end
+ if ${vN}>5000000 then error('unauthorized [sodium v4]') end
 end
--- [3] Thu thập executor (để server watermark + phát hiện fake hàng loạt)
 local ${vE}=(typeof(identifyexecutor)=='function' and identifyexecutor() or 'unknown')
 local ${vU}=(${hostLua})..'?s='..${vS}..'&k='..${vT}..'&hwid='..${vH}..'&place='..${vP}..'&n='..tostring(${vN})..'&job='..${vJ}:gsub('[^%w%-]','')..'&exec='..tostring(${vE}):gsub('[^%w%-%. ]',''):sub(1,24)${keyTail}
 loadstring(game:HttpGet(${vU}))()
 `;
-}
-
-// Loader giả cho AI/datacenter: nhìn Y CHANG thật (ticket format chuẩn) nhưng sig random -> payload 100% DIE.
-// AI tưởng bypass được, mang về phân tích tốn token vô ích.
-function buildFakeLoader(host) {
-  const fakeTicket = P.makeTicket();
-  const fakeSig = "0".repeat(64).replace(/0/g, () => Math.floor(Math.random() * 16).toString(16));
-  return buildLoader(host, fakeTicket, fakeSig, "");
 }
 
 async function handler(req, res) {
@@ -88,26 +78,32 @@ async function handler(req, res) {
   if (!P.isRoblox(req)) return P.sendBlack(req, res);
 
   const ip = P.getIp(req);
-  const ukey = (((req.query || {}).key) || "").toString().replace(/[^0-9a-f.]/g, "").slice(0, 80);
+  const host = P.getHost(req);
+  const q = req.query || {};
+  const ukey = ((q.key) || "").toString().replace(/[^0-9a-f.]/g, "").slice(0, 80);
+  const uhwid = P.sanitizeHwid(q.hwid);
 
-  // AI chạy từ cloud (OpenAI/Azure/GCP): trả loader GIẢ để nó tưởng thật, payload sau đó tarpit.
-  // Fail-open cho user thật: nếu API check hỏng -> coi như residential -> cho ticket thật.
-  try {
-    if (await P.isDatacenterIP(ip)) {
-      res.setHeader("Content-Type", "text/plain; charset=utf-8");
-      return res.status(200).send(buildFakeLoader(P.getHost(req)));
-    }
-  } catch (e) {}
-  // Tín hiệu bot rõ rệt (UA python/curl, header browser) -> cũng trả giả.
-  if (P.aiSignals(req) >= 3) {
-    res.setHeader("Content-Type", "text/plain; charset=utf-8");
-    return res.status(200).send(buildFakeLoader(P.getHost(req)));
+  // Cửa chính v4: thiếu key hoặc thiếu hwid -> KHÔNG ticket, chỉ helper báo link verify.
+  // Chain AI cũ (GET /api/raw trơn -> ticket fresh) DIE tại đây.
+  if (!ukey || !P.validHwid(uhwid) || !P.verifyUserKey(ukey, uhwid)) {
+    return P.sendVerifyHelper(res, host);
   }
 
+  // Key đúng nhưng IP datacenter -> tarpit (chặn AI solve Turnstile 1 lần rồi scrape từ cloud).
+  // User VPN datacenter bị ảnh hưởng: tradeoff đã ghi rõ, dùng mạng dân cư để chạy.
+  try {
+    if (await P.isDatacenterIP(ip)) return P.sendTarpit(res);
+  } catch (e) {}
+  if (P.aiSignals(req) >= 3) return P.sendTarpit(res);
+
+  if (!P.checkHwidThrottle(uhwid, ip)) return P.sendLuaError(res);
+
+  // Ticket bind CẢ subnet IP lẫn HWID đã verify -> đổi hwid lúc gọi payload là DIE.
   const ticket = P.makeTicket();
-  const sig = P.signTicket(ticket, ip); // bind /24 subnet
+  const sig = P.signTicket(ticket, ip, uhwid);
+  P.rememberHwid(uhwid);
   res.setHeader("Content-Type", "text/plain; charset=utf-8");
-  return res.status(200).send(buildLoader(P.getHost(req), ticket, sig, ukey));
+  return res.status(200).send(buildLoader(host, ticket, sig, ukey, uhwid));
 }
 
 module.exports = handler;

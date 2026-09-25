@@ -1,6 +1,6 @@
-// /api/payload v3 — anti-AI: ticket bind IP/24 + PoW Lua + Turnstile gate cho HWID lạ.
-// AI fetch ?s=&k=&hwid=test với UA fake -> DIE. Phải: qua /api/raw (residential IP) lấy ticket
-// fresh bind subnet, exec Lua giải PoW, gửi đúng hwid+place+nonce+job, HWID lạ phải có ?key= Turnstile.
+// /api/payload v4 — REQUIRE key Turnstile luôn, ticket bind (IP/24 + HWID).
+// Chain AI cũ: payload?s=..&k=<ticket fresh public>&hwid=recrack-01&place=0&key=db123 -> DIE toàn tập:
+//   place=0 DIE (validPlace), key=db123 DIE (verifyUserKey), hwid tự khai DIE (ticket bind HWID).
 
 const P = require("./_protect");
 
@@ -25,7 +25,7 @@ function buildStub(blobB64, sigHex) {
   const vD = randName(), vH = randName(), vK = randName(), vR = randName();
   const vS = randName(), vJ = randName();
   const junk = Math.floor(Math.random() * 900000 + 100000);
-  return `-- sodium v3 stub
+  return `-- sodium v4 stub
 local ${vB}='${blobB64}'
 local ${vG}='${sigHex}'
 local ${vC}='ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/'
@@ -45,7 +45,7 @@ local function ${vD}(${vH})
  end
  return table.concat(${vR})
 end
-if typeof(game)~='Instance' then error('unauthorized [sodium v3]') end
+if typeof(game)~='Instance' then error('unauthorized [sodium v4]') end
 local ${vH}=(typeof(gethwid)=='function' and gethwid() or game:GetService('RbxAnalyticsService'):GetClientId())
 ${vH}=tostring(${vH} or 'unknown'):gsub('[^%w%-%.:]','')
 local ${vK}=${vG}..'|'..${vH}
@@ -81,7 +81,7 @@ async function handler(req, res) {
   if (!P.validPlace(place)) return P.sendLuaError(res);
   if (!P.placeAllowed(place)) {
     res.setHeader("Content-Type", "text/plain; charset=utf-8");
-    return res.status(200).send(`error("wrong game [sodium v3]")`);
+    return res.status(200).send(`error("wrong game [sodium v4]")`);
   }
   // JobId attestation nhẹ: real server luôn có JobId UUID 36 ký tự, Studio cho 'unknown'.
   // AI gửi bừa place=1/job=test -> DIE ở format. Không chặn cứng Studio (cho 'unknown' qua).
@@ -94,30 +94,27 @@ async function handler(req, res) {
   } catch (e) {}
   if (P.aiSignals(req) >= 3) return P.sendTarpit(res);
 
-  // k = ticket.sig  (ticket = rand16.ts10 , sig = hmac64 bind /24 subnet lúc xin raw)
+  // v4: key Turnstile BẮT BUỘC cho mọi request — không còn đường free/isKnownHwid.
+  // key=db123 sai -> DIE ở đây trước cả khi check ticket (đúng case AI vừa bẻ).
+  if (!ukey || !P.verifyUserKey(ukey, hwid)) {
+    const host = P.getHost(req);
+    res.setHeader("Content-Type", "text/plain; charset=utf-8");
+    return res.status(200).send(`error("verify required: open https://${host}/api/verify?hwid=${hwid} [sodium v4]")`);
+  }
+
+  // k = ticket.sig (ticket = rand16.ts10, sig = HMAC bind subnet+HWID lúc xin raw)
   const m = k.match(/^([0-9a-f]{16}\.\d{10})\.([0-9a-f]{64})$/);
   if (!m) return P.sendLuaError(res);
   const ticket = m[1];
   const sig = m[2];
-  // 1) Ticket phải bind đúng subnet IP hiện tại -> share ticket sang IP khác DIE
-  if (!P.verifyTicket(ticket, sig, ip)) return P.sendLuaError(res);
+  // 1) Ticket phải bind đúng subnet IP + đúng HWID đã verify -> đổi hwid (recrack-01) DIE
+  if (!P.verifyTicket(ticket, sig, ip, hwid)) return P.sendLuaError(res);
   // 2) PoW: phải exec Lua mới có nonce -> curl chay DIE
   if (!P.powVerify(ticket, nonce)) return P.sendLuaError(res);
-  // 3) Replay: 1 ticket 1 lần
+  // 3) Replay: 1 ticket 1 lần (per-instance; muốn tuyệt đối thì dùng KV/Redis)
   if (!P.markUsed(ticket)) return P.sendLuaError(res);
-  // 4) Throttle ngầm free
+  // 4) Throttle: chặn xoay HWID dump hàng loạt
   if (!P.checkHwidThrottle(hwid, ip)) return P.sendLuaError(res);
-
-  // 5) HWID lạ chưa từng thấy + không có key Turnstile -> bắt verify browser 1 lần.
-  // AI curl với hwid random mỗi lần DIE ở đây (không giải được Turnstile bằng curl).
-  // User thật: mở /api/verify?hwid=... 1 lần, lấy loader cá nhân (?key=) là xong 365 ngày.
-  const hasKey = ukey && P.verifyUserKey(ukey, hwid);
-  if (!P.isKnownHwid(hwid) && !hasKey) {
-    // Nếu key sai định dạng mà HWID lạ -> cũng bắt verify (không lộ thêm info).
-    const host = P.getHost(req);
-    res.setHeader("Content-Type", "text/plain; charset=utf-8");
-    return res.status(200).send(`error("verify required: open https://${host}/api/verify?hwid=${hwid} [sodium v3]")`);
-  }
   P.rememberHwid(hwid);
 
   // Mã hoá bằng key STRING (sig|hwid) để stub Lua khớp 100%.

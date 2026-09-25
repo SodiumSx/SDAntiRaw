@@ -220,19 +220,22 @@ function makeTicket() {
   return `${randHex(8)}.${Math.floor(Date.now() / 1000)}`;
 }
 
-// sig = HMAC_SHA256(LOADER_SECRET, SCRIPT_ID|ticket|subnet)
-function signTicket(ticket, ip) {
+// v4: sig = HMAC_SHA256(LOADER_SECRET, SCRIPT_ID|ticket|subnet|hwid)
+// Ticket bind CẢ subnet IP lẫn HWID đã verify -> đổi hwid (recrack-01) là sig DIE ngay.
+// Stateless (HMAC) nên sống sót cross-instance Vercel, không cần KV.
+function signTicket(ticket, ip, hwid) {
   const sub = getIpSubnet(ip || "unknown");
-  return crypto.createHmac("sha256", LOADER_SECRET).update(`${SCRIPT_ID}|${ticket}|${sub}`).digest("hex");
+  const h = sanitizeHwid(hwid || "unknown");
+  return crypto.createHmac("sha256", LOADER_SECRET).update(`${SCRIPT_ID}|${ticket}|${sub}|${h}`).digest("hex");
 }
 
-function verifyTicket(ticket, sig, ip) {
+function verifyTicket(ticket, sig, ip, hwid) {
   if (typeof ticket !== "string" || typeof sig !== "string") return false;
   if (!/^[0-9a-f]{16}\.\d{10}$/.test(ticket)) return false;
   if (!/^[0-9a-f]{64}$/.test(sig)) return false;
   const ts = parseInt(ticket.split(".")[1], 10) * 1000;
   if (Math.abs(Date.now() - ts) > TICKET_TTL * 1000) return false;
-  const expect = signTicket(ticket, ip || "unknown");
+  const expect = signTicket(ticket, ip || "unknown", hwid || "unknown");
   const a = Buffer.from(expect, "hex");
   const b = Buffer.from(sig, "hex");
   if (a.length !== b.length) return false;
@@ -255,7 +258,9 @@ function powVerify(ticket, nonce) {
   return powHash(`${ticket}|${n}`) % POW_DIFFICULTY === 0;
 }
 
-// HWID lạ chưa từng thấy + không có key Turnstile -> bắt verify (AI curl với hwid random DIE ở đây).
+// v4: KHÔNG còn đường free cho "HWID đã thấy". seenHwids chỉ giữ để thống kê,
+// auth duy nhất là userKey (Turnstile) — vì watermark `-- licensed:HWID` sẽ lộ HWID,
+// attacker dùng HWID leak để spoof là bypass ngay nếu còn bypass này.
 function isKnownHwid(hwid) {
   return seenHwids.has(hwid);
 }
@@ -299,8 +304,15 @@ function sanitizePlace(place) {
 }
 
 function validPlace(place) {
+  // v4: chặn place=0/1 (AI hay dùng để test). PlaceId thật luôn >= 4 chữ số.
   const p = sanitizePlace(place);
-  return p.length >= 1 && /^\d{1,12}$/.test(p);
+  if (!/^\d{4,12}$/.test(p)) return false;
+  try {
+    if (parseInt(p, 10) < 1000) return false;
+  } catch (e) {
+    return false;
+  }
+  return true;
 }
 
 function placeAllowed(place) {
@@ -351,9 +363,22 @@ function sendBlack(req, res) {
 }
 
 function sendLuaError(res) {
-  // Cố tình chung 1 message, không lộ lý do (sai ticket? sai hwid? replay?)
+  // Cố tình chung 1 message, không lộ lý do (sai ticket? sai hwid? replay? sai PoW?)
   res.setHeader("Content-Type", "text/plain; charset=utf-8");
-  return res.status(200).send(`error("unauthorized [sodium v2]")`);
+  return res.status(200).send(`error("unauthorized [sodium v4]")`);
+}
+
+// Helper cho loader public chưa verify: không cấp ticket, chỉ trả Lua thu HWID
+// rồi báo link verify cá nhân. AI cũng nhận cái này -> bắt buộc qua Turnstile browser.
+function sendVerifyHelper(res, host) {
+  const h = (host || REAL_HOST).toString().replace(/["'<>&\s]/g, "");
+  res.setHeader("Content-Type", "text/plain; charset=utf-8");
+  return res.status(200).send(
+`-- sodium v4: verify 1 lan de lay loader ca nhan
+local _g=(typeof(gethwid)=='function' and gethwid() or game:GetService('RbxAnalyticsService'):GetClientId())
+local _h=tostring(_g or 'unknown'):gsub('[^%w%-%.:]','')
+error("verify required: open https://${h}/api/verify?hwid=".._h.." [sodium v4]")
+`);
 }
 
 // Bẫy AI: trả về Lua nhìn RẤT thật (dài, giống hub obfuscated) nhưng chạy không ra gì.
@@ -419,5 +444,6 @@ module.exports = {
   noCache,
   sendBlack,
   sendLuaError,
+  sendVerifyHelper,
   sendTarpit,
 };

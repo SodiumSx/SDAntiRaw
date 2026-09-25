@@ -102,7 +102,9 @@ async function handler(req, res) {
     if (!ok) return json(res, 403, { ok: false, error: "turnstile" });
     const key = P.makeUserKey(hwid, 365);
     const host = P.getHost(req);
-    const loader = `loadstring(game:HttpGet("https://${host}/api/raw?key=${key}"))()`;
+    // v4: loader cá nhân TỰ thu HWID rồi gọi raw kèm key+hwid -> raw mới bind ticket theo HWID.
+    // Không gửi hwid ở đây (browser không biết HWID executor), executor sẽ tự điền lúc chạy.
+    const loader = `local _h=(typeof(gethwid)=='function' and gethwid() or game:GetService('RbxAnalyticsService'):GetClientId());loadstring(game:HttpGet("https://${host}/api/raw?key=${key}&hwid="..tostring(_h):gsub('[^%w%-%.:]','')))()`;
     return json(res, 200, { ok: true, loader });
   }
 
