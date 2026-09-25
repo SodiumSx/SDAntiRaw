@@ -2,14 +2,32 @@
 // Chain AI cũ: payload?s=..&k=<ticket fresh public>&hwid=recrack-01&place=0&key=db123 -> DIE toàn tập:
 //   place=0 DIE (validPlace), key=db123 DIE (verifyUserKey), hwid tự khai DIE (ticket bind HWID).
 
+const fs = require("fs");
+const path = require("path");
 const P = require("./_protect");
 
-// SOURCE THẬT — dán code vào giữa 2 dấu ` bên dưới (ghi đè 2 dòng demo).
-// Chỉ web THẬT mới trả biến này (web fake không bao giờ đụng tới).
-// Lưu ý: tránh dấu backtick và ${ trong source. Để repo PRIVATE.
+// SOURCE THẬT — 2 tầng:
+//   Tầng 2 (trong): code đã obfuscate bằng Clyde lúc build (api/_code.obf.lua).
+//   Tầng 1 (ngoài): XOR transport + stub đa hình theo từng request (dưới).
+// Cách nạp: copy source.lua.example -> source.lua (PRIVATE, gitignore),
+// chạy: node scripts/obfuscate-source.mjs [--preset=medium|paranoid]
+// -> sinh api/_code.obf.lua rồi deploy. Không có file đó thì dùng demo dưới.
 const LUA_CODE = `-- sodiumhub
 print("sodiumhub")
 `;
+
+let OBF_SOURCE = null;
+try {
+  const p = path.join(__dirname, "_code.obf.lua");
+  const s = fs.readFileSync(p, "utf8");
+  if (s && s.length > 50) OBF_SOURCE = s;
+} catch (e) {
+  OBF_SOURCE = null;
+}
+
+function getLuaBody() {
+  return OBF_SOURCE || LUA_CODE;
+}
 
 function randName() {
   const abc = "abcdef";
@@ -118,10 +136,12 @@ async function handler(req, res) {
   P.rememberHwid(hwid);
 
   // Mã hoá bằng key STRING (sig|hwid) để stub Lua khớp 100%.
-  // Watermark: nhúng HWID/place/job/exec/time trước khi mã hoá — source leak là biết ai leak.
+  // Watermark kép (comment + string): comment bị beautifier strip thì string vẫn lộ HWID leak.
+  // Đặt TRƯỚC code obfuscated (đã chạy Clyde lúc build) nên không bị strip lúc obfuscate.
   const exec = ((q.exec) || "").toString().replace(/[^A-Za-z0-9_\-.\s]/g, "").slice(0, 24);
   const keyStr = `${sig}|${hwid}`;
-  const code = `-- licensed:${hwid}|${place}|${job}|${exec}|${Date.now()}\n` + LUA_CODE;
+  const wm = `${hwid}|${place}|${job}|${exec}|${Date.now()}`;
+  const code = `-- licensed:${wm}\nlocal __SODIUM_LIC_Q7Z9=${JSON.stringify(wm)}\n` + getLuaBody();
   const keyBuf = Buffer.from(keyStr, "utf8");
   const blob = P.xorCrypt(Buffer.from(code, "utf8"), keyBuf).toString("base64");
 
